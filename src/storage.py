@@ -33,6 +33,19 @@ async def init_db(db_path: str = DB_PATH) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_request_log_key_ts
                 ON request_log (client_key, ts);
+
+            CREATE TABLE IF NOT EXISTS event_log (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_key TEXT NOT NULL,
+                allowed    INTEGER NOT NULL,
+                ts         REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_event_log_ts
+                ON event_log (ts);
+
+            CREATE INDEX IF NOT EXISTS idx_event_log_key_ts
+                ON event_log (client_key, ts);
         """)
         await db.commit()
 
@@ -126,6 +139,60 @@ async def count_requests_in_window(client_key: str, window_start: float, db_path
         ) as cursor:
             row = await cursor.fetchone()
     return row[0] if row else 0
+
+
+async def log_event(client_key: str, allowed: bool, ts: float, db_path: str = DB_PATH) -> None:
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "INSERT INTO event_log (client_key, allowed, ts) VALUES (?, ?, ?)",
+            (client_key, 1 if allowed else 0, ts),
+        )
+        await db.execute("DELETE FROM event_log WHERE ts < ?", (ts - 3600,))
+        await db.commit()
+
+
+async def get_stats(window_seconds: float = 60.0, db_path: str = DB_PATH) -> dict:
+    now = time.time()
+    since = now - window_seconds
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT
+                client_key,
+                COUNT(*)                        AS total,
+                SUM(allowed)                    AS allowed,
+                COUNT(*) - SUM(allowed)         AS denied,
+                ROUND(COUNT(*) / ?,  2)         AS req_rate,
+                ROUND((COUNT(*) - SUM(allowed)) / ?, 2) AS deny_rate
+            FROM event_log
+            WHERE ts >= ?
+            GROUP BY client_key
+            ORDER BY total DESC
+            """,
+            (window_seconds, window_seconds, since),
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        async with db.execute(
+            "SELECT COUNT(*), SUM(allowed) FROM event_log WHERE ts >= ?", (since,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            total_all = row[0] or 0
+            allowed_all = row[1] or 0
+
+    return {
+        "window_seconds": window_seconds,
+        "since": since,
+        "totals": {
+            "requests": total_all,
+            "allowed": allowed_all,
+            "denied": total_all - allowed_all,
+            "req_rate": round(total_all / window_seconds, 2),
+            "deny_rate": round((total_all - allowed_all) / window_seconds, 2),
+        },
+        "clients": [dict(r) for r in rows],
+    }
 
 
 async def add_request_log(client_key: str, ts: float, db_path: str = DB_PATH) -> None:

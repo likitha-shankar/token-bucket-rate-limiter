@@ -1,10 +1,12 @@
+import asyncio
 import math
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path as FilePath
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, Path, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, HTTPException, Path, Response
+from fastapi.responses import HTMLResponse
 
 from src import storage
 from src.limiter import RateLimiter
@@ -54,6 +56,8 @@ async def check_rate_limit(
         response.headers["Retry-After"] = str(max(1, retry_after))
         response.status_code = 429
 
+    asyncio.ensure_future(storage.log_event(client_key, result.allowed, time.time()))
+
     config = await storage.get_client(client_key)
     return CheckResponse(
         allowed=result.allowed,
@@ -93,6 +97,19 @@ async def delete_client(client_key: str):
     deleted = await storage.delete_client(client_key)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"Client '{client_key}' not found")
+
+
+# ── Stats & Dashboard ──────────────────────────────────────────────────────────
+
+@app.get("/stats")
+async def get_stats(window: float = 60.0):
+    return await storage.get_stats(window_seconds=window)
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    html = (FilePath(__file__).parent / "dashboard.html").read_text()
+    return HTMLResponse(content=html)
 
 
 # ── Health ─────────────────────────────────────────────────────────────────────

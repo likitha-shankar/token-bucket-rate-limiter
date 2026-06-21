@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Rate Limiter Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #0f1117; color: #e2e8f0; min-height: 100vh; padding: 24px; }
+  h1 { font-size: 1.4rem; font-weight: 600; color: #f8fafc; margin-bottom: 4px; }
+  .subtitle { font-size: 0.8rem; color: #64748b; margin-bottom: 24px; }
+  .summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 24px; }
+  .card { background: #1e2433; border: 1px solid #2d3748; border-radius: 10px; padding: 16px; }
+  .card-label { font-size: 0.7rem; color: #64748b; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 6px; }
+  .card-value { font-size: 1.8rem; font-weight: 700; }
+  .card-value.green  { color: #4ade80; }
+  .card-value.red    { color: #f87171; }
+  .card-value.blue   { color: #60a5fa; }
+  .card-value.yellow { color: #fbbf24; }
+  .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
+  .chart-card { background: #1e2433; border: 1px solid #2d3748; border-radius: 10px; padding: 20px; }
+  .chart-card h2 { font-size: 0.85rem; color: #94a3b8; margin-bottom: 16px; font-weight: 500; }
+  canvas { max-height: 220px; }
+  table { width: 100%; border-collapse: collapse; background: #1e2433;
+          border: 1px solid #2d3748; border-radius: 10px; overflow: hidden; }
+  th { background: #161b27; font-size: 0.7rem; text-transform: uppercase;
+       letter-spacing: .05em; color: #64748b; padding: 10px 14px; text-align: left; }
+  td { padding: 10px 14px; font-size: 0.82rem; border-top: 1px solid #2d3748; }
+  tr:hover td { background: #212840; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 0.7rem; font-weight: 600; }
+  .badge-tb { background: #1e3a5f; color: #60a5fa; }
+  .badge-sw { background: #2d1b4e; color: #c084fc; }
+  .bar { height: 6px; border-radius: 3px; background: #2d3748; overflow: hidden; }
+  .bar-inner { height: 100%; border-radius: 3px; background: #4ade80; transition: width .3s; }
+  #status { position: fixed; bottom: 16px; right: 20px; font-size: 0.72rem; color: #475569; }
+  .pulse { display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+           background: #4ade80; margin-right: 6px; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+</style>
+</head>
+<body>
+
+<h1>Rate Limiter Dashboard</h1>
+<div class="subtitle">Live stats · rolling 60s window · auto-refreshes every second</div>
+
+<div class="summary">
+  <div class="card">
+    <div class="card-label">Total Requests / s</div>
+    <div class="card-value blue" id="stat-rps">—</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Allowed / s</div>
+    <div class="card-value green" id="stat-allow">—</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Denied / s</div>
+    <div class="card-value red" id="stat-deny">—</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Active Clients</div>
+    <div class="card-value yellow" id="stat-clients">—</div>
+  </div>
+</div>
+
+<div class="charts">
+  <div class="chart-card">
+    <h2>Requests over time (last 60s)</h2>
+    <canvas id="timeChart"></canvas>
+  </div>
+  <div class="chart-card">
+    <h2>Allow vs Deny per client</h2>
+    <canvas id="clientChart"></canvas>
+  </div>
+</div>
+
+<table>
+  <thead>
+    <tr>
+      <th>Client</th>
+      <th>Algorithm</th>
+      <th>Requests (60s)</th>
+      <th>Allowed</th>
+      <th>Denied</th>
+      <th>Req/s</th>
+      <th>Deny/s</th>
+      <th>Allow rate</th>
+    </tr>
+  </thead>
+  <tbody id="client-table"></tbody>
+</table>
+
+<div id="status"><span class="pulse"></span>Connecting…</div>
+
+<script>
+const WINDOW = 60;
+const HISTORY_LEN = 60;
+
+// Rolling time-series: one bucket per second
+const history = { labels: [], reqs: [], allowed: [], denied: [] };
+for (let i = HISTORY_LEN; i >= 0; i--) {
+  history.labels.push(`-${i}s`);
+  history.reqs.push(0);
+  history.allowed.push(0);
+  history.denied.push(0);
+}
+
+let prevTotals = null;
+
+const timeCtx = document.getElementById('timeChart').getContext('2d');
+const timeChart = new Chart(timeCtx, {
+  type: 'line',
+  data: {
+    labels: history.labels,
+    datasets: [
+      { label: 'Requests', data: history.reqs,    borderColor: '#60a5fa', backgroundColor: 'rgba(96,165,250,.08)', tension: 0.3, pointRadius: 0, fill: true },
+      { label: 'Allowed',  data: history.allowed, borderColor: '#4ade80', backgroundColor: 'rgba(74,222,128,.08)', tension: 0.3, pointRadius: 0, fill: true },
+      { label: 'Denied',   data: history.denied,  borderColor: '#f87171', backgroundColor: 'rgba(248,113,113,.08)', tension: 0.3, pointRadius: 0, fill: true },
+    ]
+  },
+  options: {
+    animation: false,
+    plugins: { legend: { labels: { color: '#94a3b8', boxWidth: 12, font: { size: 11 } } } },
+    scales: {
+      x: { ticks: { color: '#475569', maxTicksLimit: 10, font: { size: 10 } }, grid: { color: '#1e2433' } },
+      y: { ticks: { color: '#475569', font: { size: 10 } }, grid: { color: '#2d3748' }, beginAtZero: true }
+    }
+  }
+});
+
+const clientCtx = document.getElementById('clientChart').getContext('2d');
+const clientChart = new Chart(clientCtx, {
+  type: 'bar',
+  data: { labels: [], datasets: [
+    { label: 'Allowed', data: [], backgroundColor: '#4ade80' },
+    { label: 'Denied',  data: [], backgroundColor: '#f87171' },
+  ]},
+  options: {
+    animation: false,
+    plugins: { legend: { labels: { color: '#94a3b8', boxWidth: 12, font: { size: 11 } } } },
+    scales: {
+      x: { stacked: true, ticks: { color: '#475569', font: { size: 10 } }, grid: { color: '#1e2433' } },
+      y: { stacked: true, ticks: { color: '#475569', font: { size: 10 } }, grid: { color: '#2d3748' }, beginAtZero: true }
+    }
+  }
+});
+
+function push(arr, val) { arr.push(val); if (arr.length > HISTORY_LEN + 1) arr.shift(); }
+
+async function fetchStats() {
+  const resp = await fetch(`/stats?window=${WINDOW}`);
+  if (!resp.ok) return;
+  const data = await resp.json();
+  const t = data.totals;
+
+  // Summary cards
+  document.getElementById('stat-rps').textContent     = t.req_rate.toFixed(1);
+  document.getElementById('stat-allow').textContent   = (t.allowed / WINDOW).toFixed(1);
+  document.getElementById('stat-deny').textContent    = t.deny_rate.toFixed(1);
+  document.getElementById('stat-clients').textContent = data.clients.length;
+
+  // Time series — push delta since last tick
+  const reqs    = prevTotals ? Math.max(0, t.requests - prevTotals.requests) : 0;
+  const allowed = prevTotals ? Math.max(0, t.allowed  - prevTotals.allowed)  : 0;
+  const denied  = prevTotals ? Math.max(0, t.denied   - prevTotals.denied)   : 0;
+  prevTotals = { ...t };
+
+  push(history.reqs,    reqs);
+  push(history.allowed, allowed);
+  push(history.denied,  denied);
+
+  const now = new Date();
+  push(history.labels, `${now.getHours()}:${String(now.getMinutes()).padStart(2,'0')}:${String(now.getSeconds()).padStart(2,'0')}`);
+
+  timeChart.data.labels           = history.labels;
+  timeChart.data.datasets[0].data = history.reqs;
+  timeChart.data.datasets[1].data = history.allowed;
+  timeChart.data.datasets[2].data = history.denied;
+  timeChart.update('none');
+
+  // Per-client bar chart
+  const keys = data.clients.map(c => c.client_key);
+  clientChart.data.labels             = keys;
+  clientChart.data.datasets[0].data   = data.clients.map(c => c.allowed);
+  clientChart.data.datasets[1].data   = data.clients.map(c => c.denied);
+  clientChart.update('none');
+
+  // Table
+  const tbody = document.getElementById('client-table');
+  tbody.innerHTML = data.clients.map(c => {
+    const allowPct = c.total > 0 ? (c.allowed / c.total * 100) : 0;
+    const algo = c.algorithm === 'sliding_window'
+      ? '<span class="badge badge-sw">sliding</span>'
+      : '<span class="badge badge-tb">token</span>';
+    return `<tr>
+      <td><strong>${c.client_key}</strong></td>
+      <td>${algo}</td>
+      <td>${c.total}</td>
+      <td style="color:#4ade80">${c.allowed}</td>
+      <td style="color:#f87171">${c.denied}</td>
+      <td>${c.req_rate}</td>
+      <td>${c.deny_rate}</td>
+      <td>
+        <div class="bar"><div class="bar-inner" style="width:${allowPct.toFixed(1)}%;background:${allowPct > 50 ? '#4ade80' : '#f87171'}"></div></div>
+        <span style="font-size:.7rem;color:#64748b">${allowPct.toFixed(0)}%</span>
+      </td>
+    </tr>`;
+  }).join('');
+
+  document.getElementById('status').innerHTML =
+    `<span class="pulse"></span>Live · updated ${new Date().toLocaleTimeString()}`;
+}
+
+fetchStats();
+setInterval(fetchStats, 1000);
+</script>
+</body>
+</html>
